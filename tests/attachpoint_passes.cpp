@@ -146,12 +146,18 @@ TEST_F(attachpoint_parser_dwarf, uprobe)
              R"(Source code location not allowed)");
   test_error("uprobe:*@data_source.c:195 { 1 }",
              R"(Cannot use wildcards with source code location)");
-  test_error(ap + "@ { 1 }", R"(ERROR: syntax error, unexpected {)");
-  test_error(ap + "@: { 1 }", R"(ERROR: syntax error, unexpected :)");
+  test_error(
+      ap + "@ { 1 }",
+      R"(ERROR: Invalid uprobe arguments, expected format: uprobe:TARGET@FILE:LINE[:COL])");
+  test_error(
+      ap + "@: { 1 }",
+      R"(ERROR: Invalid uprobe arguments, expected format: uprobe:TARGET@FILE:LINE[:COL])");
   test_error(
       ap + "@data_source.c: { 1 }",
       R"(Invalid uprobe arguments, expected format: uprobe:TARGET@FILE:LINE[:COL])");
-  test_error(ap + "@:195 { 1 }", R"(ERROR: syntax error, unexpected path)");
+  test_error(
+      ap + "@:195 { 1 }",
+      R"(ERROR: Invalid uprobe arguments, expected format: uprobe:TARGET@FILE:LINE[:COL])");
   test_error(
       ap + "@data_source.c:195:1:2:3 { 1 }",
       R"(Invalid uprobe arguments, expected format: uprobe:TARGET@FILE:LINE[:COL])");

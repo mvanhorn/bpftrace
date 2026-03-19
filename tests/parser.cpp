@@ -10,6 +10,7 @@
 #include "ast_matchers.h"
 #include "driver.h"
 #include "mocks.h"
+#include "rd_parser.h"
 #include "gtest/gtest.h"
 
 namespace bpftrace::test::parser {
@@ -43,9 +44,12 @@ using bpftrace::test::Variable;
 using bpftrace::test::VariableAddr;
 using bpftrace::test::While;
 
+using ::testing::HasSubstr;
+
 void test_parse_failure(BPFtrace &bpftrace,
                         const std::string &input,
-                        std::string_view expected_error)
+                        std::string_view expected_error,
+                        bool contains = false)
 {
   std::stringstream out;
   ast::ASTContext ast("stdin", input);
@@ -64,7 +68,12 @@ void test_parse_failure(BPFtrace &bpftrace,
   if (expected_error.data()) {
     if (!expected_error.empty() && expected_error[0] == '\n')
       expected_error.remove_prefix(1); // Remove initial '\n'
-    EXPECT_EQ(expected_error, out.str());
+
+    if (contains) {
+      EXPECT_THAT(out.str(), HasSubstr(expected_error));
+    } else {
+      EXPECT_EQ(expected_error, out.str());
+    }
   }
 }
 
@@ -73,6 +82,13 @@ void test_parse_failure(const std::string &input,
 {
   BPFtrace bpftrace;
   test_parse_failure(bpftrace, input, expected_error);
+}
+
+void test_error_contains(const std::string &input,
+                         std::string_view expected_error)
+{
+  BPFtrace bpftrace;
+  test_parse_failure(bpftrace, input, expected_error, true);
 }
 
 void test_macro_parse_failure(BPFtrace &bpftrace,
@@ -351,6 +367,65 @@ TEST(Parser, __comment)
   test("kprobe:f { /*** ***/0; }",
        Program().WithProbe(
            Probe({ "kprobe:f" }, { ExprStatement(Integer(0)) })));
+}
+
+TEST(Parser, shebang)
+{
+  test("#!/usr/bin/env bpftrace\nkprobe:f { 0; }",
+       Program()
+           .WithHeader("#!/usr/bin/env bpftrace\n")
+           .WithProbe(Probe({ "kprobe:f" }, { ExprStatement(Integer(0)) })));
+  test("#!/usr/bin/env bpftrace\n",
+       Program().WithHeader("#!/usr/bin/env bpftrace\n"));
+}
+
+TEST(Parser, comments_preserved)
+{
+  BPFtrace bpftrace;
+  const std::string input = R"(#!/usr/bin/env bpftrace
+
+// top level comment
+begin
+{
+  // inside comment
+  /*
+   * block comment
+   */
+  print(1);
+}
+)";
+
+  // block comments get turned into multiple single line comments by the
+  // formatter
+  const std::string output = R"(#!/usr/bin/env bpftrace
+
+// top level comment
+begin
+{
+  // inside comment
+  // block comment
+  print(1);
+}
+)";
+
+  ast::ASTContext ast("stdin", input);
+  auto ok = ast::PassManager()
+                .put(ast)
+                .put(bpftrace)
+                .put(get_mock_function_info())
+                .add(CreateParsePass())
+                .add(ast::CreateParseAttachpointsPass())
+                .run();
+  ASSERT_TRUE(bool(ok));
+
+  std::ostringstream out;
+  ast.diagnostics().emit(out);
+  ASSERT_TRUE(ast.diagnostics().ok()) << out.str();
+
+  std::stringstream ss;
+  ast::Printer printer(ast, ss);
+  printer.visit(ast.root);
+  EXPECT_EQ(ss.str(), output);
 }
 
 TEST(Parser, map_assign)
@@ -1074,6 +1149,15 @@ TEST(Parser, escape_chars)
                "newline\nand tab\tcr\rbackslash\\quote\"here oct@9hex09")) })));
 }
 
+TEST(Parser, escape_chars_octal_out_of_range)
+{
+  test_parse_failure(R"(kprobe:sys_open { "\777" })", R"(
+stdin:1:20-24: ERROR: octal escape sequence out of range '\777'
+kprobe:sys_open { "\777" }
+                   ~~~~
+)");
+}
+
 TEST(Parser, begin_probe)
 {
   test("begin { 1 }",
@@ -1610,8 +1694,7 @@ TEST(Parser, cast_typedef)
        Program().WithProbe(
            Probe({ "kprobe:sys_read" },
                  { ExprStatement(
-                     Cast(Typeof(SizedType(Type::c_struct).WithName("mytype")),
-                          Builtin("arg0"))) })));
+                     Cast(Typeof(Identifier("mytype")), Builtin("arg0"))) })));
 }
 
 TEST(Parser, cast_ptr_typedef)
@@ -1632,6 +1715,24 @@ TEST(Parser, cast_multiple_pointer)
                                       Builtin("arg0"))) })));
 }
 
+TEST(Parser, cast_deep_pointer)
+{
+  test("kprobe:sys_read { (uint64 ****)arg0; }",
+       Program().WithProbe(
+           Probe({ "kprobe:sys_read" },
+                 { ExprStatement(Cast(
+                     Typeof(SizedType(Type::pointer)
+                                .WithElement(
+                                    SizedType(Type::pointer)
+                                        .WithElement(
+                                            SizedType(Type::pointer)
+                                                .WithElement(
+                                                    SizedType(Type::pointer)
+                                                        .WithElement(SizedType(
+                                                            Type::integer)))))),
+                     Builtin("arg0"))) })));
+}
+
 TEST(Parser, cast_or_expr1)
 {
   test("kprobe:sys_read { (struct mytype)*arg0; }",
@@ -1640,15 +1741,18 @@ TEST(Parser, cast_or_expr1)
            { ExprStatement(
                Cast(Typeof(SizedType(Type::c_struct).WithName("struct mytype")),
                     Unop(Operator::MUL, Builtin("arg0")))) })));
-}
 
-TEST(Parser, cast_or_expr2)
-{
   test("kprobe:sys_read { (arg1)*arg0; }",
        Program().WithProbe(Probe({ "kprobe:sys_read" },
                                  { ExprStatement(Binop(Operator::MUL,
                                                        Builtin("arg1"),
                                                        Builtin("arg0"))) })));
+
+  test("kprobe:sys_read { (mytype)*arg0; }",
+       Program().WithProbe(Probe(
+           { "kprobe:sys_read" },
+           { ExprStatement(Cast(Typeof(Identifier("mytype")),
+                                Unop(Operator::MUL, Builtin("arg0")))) })));
 }
 
 TEST(Parser, cast_precedence)
@@ -1726,9 +1830,24 @@ TEST(Parser, offsetof_type)
   test_parse_failure("struct Foo { struct Bar { int x; } *bar; } "
                      "begin { offsetof(struct Foo, bar->x); }",
                      R"(
-stdin:1:76-78: ERROR: syntax error, unexpected ->, expecting ) or .
+stdin:1:76-77: ERROR: expected ')'
 struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
-                                                                           ~~
+                                                                           ~
+stdin:1:79-80: ERROR: expected ';'
+struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
+                                                                              ~
+stdin:1:79-80: ERROR: expected expression
+struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
+                                                                              ~
+stdin:1:79-80: ERROR: expected ';'
+struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
+                                                                              ~
+stdin:1:79-80: ERROR: unexpected input in block
+struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
+                                                                              ~
+stdin:1:80-81: ERROR: expected expression
+struct Foo { struct Bar { int x; } *bar; } begin { offsetof(struct Foo, bar->x); }
+                                                                               ~
 )");
 }
 
@@ -1758,6 +1877,38 @@ TEST(Parser, offsetof_builtin_type)
                      { ExprStatement(Offsetof(
                          SizedType(Type::c_struct).WithName("struct Foo"),
                          { "timestamp" })) })));
+}
+
+TEST(Parser, sizeof_unknown_type)
+{
+  test("kprobe:sys_read { sizeof(mytype); }",
+       Program().WithProbe(
+           Probe({ "kprobe:sys_read" },
+                 { ExprStatement(Sizeof(Identifier("mytype"))) })));
+}
+
+TEST(Parser, sizeof_macro_call)
+{
+  test("kprobe:sys_read { sizeof(mymacro()); }",
+       Program().WithProbe(
+           Probe({ "kprobe:sys_read" },
+                 { ExprStatement(Sizeof(Call("mymacro", {}))) })));
+}
+
+TEST(Parser, typeinfo_unknown_type)
+{
+  test("kprobe:sys_read { typeinfo(mytype); }",
+       Program().WithProbe(
+           Probe({ "kprobe:sys_read" },
+                 { ExprStatement(Typeinfo(Typeof(Identifier("mytype")))) })));
+}
+
+TEST(Parser, typeinfo_macro_call)
+{
+  test("kprobe:sys_read { typeinfo(mymacro()); }",
+       Program().WithProbe(
+           Probe({ "kprobe:sys_read" },
+                 { ExprStatement(Typeinfo(Typeof(Call("mymacro", {})))) })));
 }
 
 TEST(Parser, dereference_precedence)
@@ -1886,57 +2037,52 @@ TEST(Parser, cstruct_nested)
                { CStatement("struct Foo { struct { int x; } bar; };") })
            .WithProbe(
                Probe({ "kprobe:sys_read" }, { ExprStatement(Integer(1)) })));
+
+  // String literal containing braces inside C definition
+  test(R"(struct Foo { char s[4]; /* = "{" */ } kprobe:sys_read { 1; })",
+       Program()
+           .WithCStatements(
+               { CStatement(R"(struct Foo { char s[4]; /* = "{" */ };)") })
+           .WithProbe(
+               Probe({ "kprobe:sys_read" }, { ExprStatement(Integer(1)) })));
+
+  // Block comment containing braces inside C definition
+  test("struct Foo { int x; /* } */ int y; } kprobe:sys_read { 1; }",
+       Program()
+           .WithCStatements(
+               { CStatement("struct Foo { int x; /* } */ int y; };") })
+           .WithProbe(
+               Probe({ "kprobe:sys_read" }, { ExprStatement(Integer(1)) })));
 }
 
 TEST(Parser, unexpected_symbol)
 {
   std::stringstream out;
   ast::ASTContext ast("stdin", "i:s:1 { < }");
-  Driver driver(ast);
-  ast.root = driver.parse_program();
+  RDParser parser(ast);
+  ast.root = parser.parse();
   ASSERT_FALSE(ast.diagnostics().ok());
   ast.diagnostics().emit(out);
   std::string expected =
-      R"(stdin:1:9-10: ERROR: syntax error, unexpected <
+      R"(stdin:1:9-10: ERROR: expected expression
 i:s:1 { < }
         ~
+stdin:1:11-12: ERROR: expected expression
+i:s:1 { < }
+          ~
 )";
   EXPECT_EQ(out.str(), expected);
 }
 
 TEST(Parser, string_with_tab)
 {
-  std::stringstream out;
-  ast::ASTContext ast("stdin", "i:s:1\t\t\t$a");
-  Driver driver(ast);
-  ast.root = driver.parse_program();
-  ASSERT_FALSE(ast.diagnostics().ok());
-  ast.diagnostics().emit(out);
-  std::string expected =
-      R"(stdin:1:9-11: ERROR: syntax error, unexpected variable, expecting {
-i:s:1            $a
-                 ~~
-)";
-  EXPECT_EQ(out.str(), expected);
+  test_error_contains("i:s:1\t\t\t$a", "stdin:1:9-11: ERROR: expected '{'");
 }
 
 TEST(Parser, unterminated_string)
 {
-  std::stringstream out;
-  ast::ASTContext ast("stdin", "kprobe:f { \"asdf }");
-  Driver driver(ast);
-  ast.root = driver.parse_program();
-  ASSERT_FALSE(ast.diagnostics().ok());
-  ast.diagnostics().emit(out);
-  std::string expected =
-      R"(stdin:1:13-19: ERROR: unterminated string
-kprobe:f { "asdf }
-            ~~~~~~
-stdin:1:13-19: ERROR: syntax error, unexpected end of file
-kprobe:f { "asdf }
-            ~~~~~~
-)";
-  EXPECT_EQ(out.str(), expected);
+  test_error_contains("kprobe:f { \"asdf }",
+                      "stdin:1:19-19: ERROR: expected ';'");
 }
 
 TEST(Parser, kprobe_offset)
@@ -1949,11 +2095,10 @@ TEST(Parser, kprobe_offset)
   test("k:\"fn.abc\"+0x10 {}",
        Program().WithProbe(Probe({ "kprobe:fn.abc+16" }, {})));
 
-  test_parse_failure("k:asdf+123abc", R"(
-stdin:1:2-14: ERROR: syntax error, unexpected end of file, expecting {
-k:asdf+123abc
- ~~~~~~~~~~~~
-)");
+  test_parse_failure("k:asdf+123abc",
+                     "stdin:1:14-14: ERROR: expected \'{\'\n"
+                     "k:asdf+123abc\n"
+                     "             \n");
 }
 
 TEST(Parser, kretprobe_offset)
@@ -1998,31 +2143,31 @@ uretprobe:/bin/sh:f+0x10 { 1 }
 TEST(Parser, invalid_increment_decrement)
 {
   test_parse_failure("i:s:1 { @=5++}", R"(
-stdin:1:12-14: ERROR: syntax error, unexpected ++, expecting ; or }
+stdin:1:12-14: ERROR: increment/decrement requires a variable or map
 i:s:1 { @=5++}
            ~~
 )");
 
   test_parse_failure("i:s:1 { @=++5}", R"(
-stdin:1:13-14: ERROR: syntax error, unexpected integer
+stdin:1:13-14: ERROR: increment/decrement requires a variable or map
 i:s:1 { @=++5}
             ~
 )");
 
   test_parse_failure("i:s:1 { @=5--}", R"(
-stdin:1:12-14: ERROR: syntax error, unexpected --, expecting ; or }
+stdin:1:12-14: ERROR: increment/decrement requires a variable or map
 i:s:1 { @=5--}
            ~~
 )");
 
   test_parse_failure("i:s:1 { @=--5}", R"(
-stdin:1:13-14: ERROR: syntax error, unexpected integer
+stdin:1:13-14: ERROR: increment/decrement requires a variable or map
 i:s:1 { @=--5}
             ~
 )");
 
   test_parse_failure("i:s:1 { @=\"a\"++}", R"(
-stdin:1:14-16: ERROR: syntax error, unexpected ++, expecting ; or }
+stdin:1:14-16: ERROR: increment/decrement requires a variable or map
 i:s:1 { @="a"++}
              ~~
 )");
@@ -2032,8 +2177,8 @@ TEST(Parser, long_param_overflow)
 {
   std::stringstream out;
   ast::ASTContext ast("stdin", "i:s:100 { @=$111111111111111111111111111 }");
-  Driver driver(ast);
-  EXPECT_NO_THROW(driver.parse_program());
+  RDParser parser(ast);
+  EXPECT_NO_THROW(parser.parse());
   ASSERT_FALSE(ast.diagnostics().ok());
   ast.diagnostics().emit(out);
   std::string expected = "stdin:1:13-41: ERROR: param "
@@ -2191,9 +2336,9 @@ TEST(Parser, int_notation)
 
   // Error tests
   test_parse_failure("k:f { print(5e-9); }", R"(
-stdin:1:14-15: ERROR: syntax error, unexpected identifier, expecting ) or ","
+stdin:1:13-15: ERROR: invalid trailing bytes: 5e
 k:f { print(5e-9); }
-             ~
+            ~~
 )");
 
   test_parse_failure("k:f { print(1e21); }", R"(
@@ -2221,31 +2366,34 @@ k:f { print(1_1e100); }
 )");
 
   test_parse_failure("k:f { print(1e1_1_); }", R"(
-stdin:1:18-19: ERROR: syntax error, unexpected _, expecting ) or ","
+stdin:1:18-19: ERROR: trailing underscore in integer literal
 k:f { print(1e1_1_); }
                  ~
 )");
 
   test_parse_failure("k:f { print(1_1_e100); }", R"(
-stdin:1:16-21: ERROR: syntax error, unexpected identifier, expecting ) or ","
+stdin:1:16-17: ERROR: trailing underscore in integer literal
 k:f { print(1_1_e100); }
-               ~~~~~
+               ~
+stdin:1:13-21: ERROR: coefficient part of scientific literal must be 1-9: 1_1_e100
+k:f { print(1_1_e100); }
+            ~~~~~~~~
 )");
 
   test_parse_failure("k:f { print(1_1_); }", R"(
-stdin:1:16-17: ERROR: syntax error, unexpected _, expecting ) or ","
+stdin:1:16-17: ERROR: trailing underscore in integer literal
 k:f { print(1_1_); }
                ~
 )");
 
   test_parse_failure("k:f { print(1ulll); }", R"(
-stdin:1:17-18: ERROR: syntax error, unexpected identifier, expecting ) or ","
+stdin:1:17-18: ERROR: invalid integer suffix 'l'
 k:f { print(1ulll); }
                 ~
 )");
 
   test_parse_failure("k:f { print(1lul); }", R"(
-stdin:1:15-17: ERROR: syntax error, unexpected identifier, expecting ) or ","
+stdin:1:15-17: ERROR: invalid integer suffix 'ul'
 k:f { print(1lul); }
               ~~
 )");
@@ -2291,7 +2439,7 @@ TEST(Parser, tuples)
                      Call("print", { Tuple({ Integer(1), Integer(2) }) })) })));
 
   test_parse_failure("k:f { print((,)); }", R"(
-stdin:1:14-15: ERROR: syntax error, unexpected ","
+stdin:1:14-15: ERROR: expected expression
 k:f { print((,)); }
              ~
 )");
@@ -2322,12 +2470,12 @@ TEST(Parser, records)
                    "a", Record({ NamedArgument("a", Integer(1)) })) }) })) })));
 
   test_parse_failure("k:f { print((hello=1, 5)); }", R"(
-stdin:1:23-24: ERROR: syntax error, unexpected integer, expecting builtin or builtin type or sized type or identifier
+stdin:1:23-24: ERROR: expected identifier
 k:f { print((hello=1, 5)); }
                       ~
 )");
   test_parse_failure("k:f { print((hello=1,)); }", R"(
-stdin:1:22-23: ERROR: syntax error, unexpected ), expecting builtin or builtin type or sized type or identifier
+stdin:1:22-23: ERROR: expected identifier
 k:f { print((hello=1,)); }
                      ~
 )");
@@ -2338,58 +2486,93 @@ k:f { print((hello=1,hello=2)); }
 )");
 }
 
-TEST(Parser, tuple_assignment_error_message)
-{
-  std::stringstream out;
-  ast::ASTContext ast("stdin", "i:s:1 { @x = (1, 2); $x.1 = 1; }");
-  Driver driver(ast);
-  ast.root = driver.parse_program();
-  ASSERT_FALSE(ast.diagnostics().ok());
-  ast.diagnostics().emit(out);
-  std::string expected =
-      R"(stdin:1:22-30: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
-i:s:1 { @x = (1, 2); $x.1 = 1; }
-                     ~~~~~~~~
-)";
-  EXPECT_EQ(out.str(), expected);
-}
-
 TEST(Parser, tuple_assignment_error)
 {
   test_parse_failure("i:s:1 { (1, 0) = 0 }", R"(
-stdin:1:16-17: ERROR: syntax error, unexpected =
+stdin:1:16-17: ERROR: expected ';'
+i:s:1 { (1, 0) = 0 }
+               ~
+stdin:1:16-17: ERROR: expected expression
+i:s:1 { (1, 0) = 0 }
+               ~
+stdin:1:16-17: ERROR: expected ';'
+i:s:1 { (1, 0) = 0 }
+               ~
+stdin:1:16-17: ERROR: unexpected input in block
 i:s:1 { (1, 0) = 0 }
                ~
 )");
 
   test_parse_failure("i:s:1 { ((1, 0), 3).0.0 = 3 }", R"(
-stdin:1:9-28: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
+stdin:1:25-26: ERROR: expected ';'
 i:s:1 { ((1, 0), 3).0.0 = 3 }
-        ~~~~~~~~~~~~~~~~~~~
+                        ~
+stdin:1:25-26: ERROR: expected expression
+i:s:1 { ((1, 0), 3).0.0 = 3 }
+                        ~
+stdin:1:25-26: ERROR: expected ';'
+i:s:1 { ((1, 0), 3).0.0 = 3 }
+                        ~
+stdin:1:25-26: ERROR: unexpected input in block
+i:s:1 { ((1, 0), 3).0.0 = 3 }
+                        ~
 )");
 
   test_parse_failure("i:s:1 { ((1, 0), 3).0 = (0, 1) }", R"(
-stdin:1:9-31: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
+stdin:1:23-24: ERROR: expected ';'
 i:s:1 { ((1, 0), 3).0 = (0, 1) }
-        ~~~~~~~~~~~~~~~~~~~~~~
+                      ~
+stdin:1:23-24: ERROR: expected expression
+i:s:1 { ((1, 0), 3).0 = (0, 1) }
+                      ~
+stdin:1:23-24: ERROR: expected ';'
+i:s:1 { ((1, 0), 3).0 = (0, 1) }
+                      ~
+stdin:1:23-24: ERROR: unexpected input in block
+i:s:1 { ((1, 0), 3).0 = (0, 1) }
+                      ~
 )");
 
   test_parse_failure(R"(i:s:1 { (1, "two", (3, 4)).5 = "six"; })", R"(
-stdin:1:9-37: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
+stdin:1:30-31: ERROR: expected ';'
 i:s:1 { (1, "two", (3, 4)).5 = "six"; }
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                             ~
+stdin:1:30-31: ERROR: expected expression
+i:s:1 { (1, "two", (3, 4)).5 = "six"; }
+                             ~
+stdin:1:30-31: ERROR: expected ';'
+i:s:1 { (1, "two", (3, 4)).5 = "six"; }
+                             ~
+stdin:1:30-31: ERROR: unexpected input in block
+i:s:1 { (1, "two", (3, 4)).5 = "six"; }
+                             ~
 )");
 
-  test_parse_failure("i:s:1 { $a = 1; $a.2 = 3 }", R"(
-stdin:1:17-25: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
-i:s:1 { $a = 1; $a.2 = 3 }
+  test_parse_failure("i:s:1 { $a = 1; $a.2 = 3; }", R"(
+stdin:1:17-25: ERROR: Tuples and records are immutable once created. Consider creating a new value and assigning it instead.
+i:s:1 { $a = 1; $a.2 = 3; }
                 ~~~~~~~~
 )");
 
+  test_parse_failure("i:s:1 { @x = (1, 2); @x.1 = 1; }", R"(
+stdin:1:22-30: ERROR: Tuples and records are immutable once created. Consider creating a new value and assigning it instead.
+i:s:1 { @x = (1, 2); @x.1 = 1; }
+                     ~~~~~~~~
+)");
+
   test_parse_failure("i:s:1 { 0.1 = 1.0 }", R"(
-stdin:1:9-18: ERROR: Tuples are immutable once created. Consider creating a new tuple and assigning it instead.
+stdin:1:13-14: ERROR: expected ';'
 i:s:1 { 0.1 = 1.0 }
-        ~~~~~~~~~
+            ~
+stdin:1:13-14: ERROR: expected expression
+i:s:1 { 0.1 = 1.0 }
+            ~
+stdin:1:13-14: ERROR: expected ';'
+i:s:1 { 0.1 = 1.0 }
+            ~
+stdin:1:13-14: ERROR: unexpected input in block
+i:s:1 { 0.1 = 1.0 }
+            ~
 )");
 }
 
@@ -2473,27 +2656,51 @@ TEST(Parser, config_error)
 {
   test_parse_failure("i:s:1 { exit(); } config = { BPFTRACE_STACK_MODE=perf }",
                      R"(
-stdin:1:19-25: ERROR: syntax error, unexpected config
+stdin:1:19-25: ERROR: config must appear before probes and functions
 i:s:1 { exit(); } config = { BPFTRACE_STACK_MODE=perf }
                   ~~~~~~
 )");
 
   test_parse_failure("config = { exit(); } i:s:1 { exit(); }", R"(
-stdin:1:16-17: ERROR: syntax error, unexpected (, expecting =
+stdin:1:16-17: ERROR: expected '='
 config = { exit(); } i:s:1 { exit(); }
                ~
+stdin:1:16-17: ERROR: expected '}'
+config = { exit(); } i:s:1 { exit(); }
+               ~
+stdin:1:20-21: ERROR: expected '{'
+config = { exit(); } i:s:1 { exit(); }
+                   ~
+stdin:1:22-23: ERROR: expected '{'
+config = { exit(); } i:s:1 { exit(); }
+                     ~
 )");
 
   test_parse_failure("config = { @start = nsecs; } i:s:1 { exit(); }", R"(
-stdin:1:12-18: ERROR: syntax error, unexpected map, expecting } or identifier
+stdin:1:12-18: ERROR: expected config key
 config = { @start = nsecs; } i:s:1 { exit(); }
            ~~~~~~
+stdin:1:12-18: ERROR: expected '}'
+config = { @start = nsecs; } i:s:1 { exit(); }
+           ~~~~~~
+stdin:1:19-20: ERROR: expected '{'
+config = { @start = nsecs; } i:s:1 { exit(); }
+                  ~
+stdin:1:21-26: ERROR: expected '{'
+config = { @start = nsecs; } i:s:1 { exit(); }
+                    ~~~~~
+stdin:1:28-29: ERROR: expected '{'
+config = { @start = nsecs; } i:s:1 { exit(); }
+                           ~
+stdin:1:30-31: ERROR: expected '{'
+config = { @start = nsecs; } i:s:1 { exit(); }
+                             ~
 )");
 
   test_parse_failure("begin { @start = nsecs; } config = { "
                      "BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }",
                      R"(
-stdin:1:27-33: ERROR: syntax error, unexpected config
+stdin:1:27-33: ERROR: config must appear before probes and functions
 begin { @start = nsecs; } config = { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
                           ~~~~~~
 )");
@@ -2501,7 +2708,7 @@ begin { @start = nsecs; } config = { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); 
   test_parse_failure("config = { BPFTRACE_STACK_MODE=perf "
                      "BPFTRACE_MAX_PROBES=2 } i:s:1 { exit(); }",
                      R"(
-stdin:1:37-56: ERROR: syntax error, unexpected identifier, expecting ; or }
+stdin:1:37-56: ERROR: expected ';'
 config = { BPFTRACE_STACK_MODE=perf BPFTRACE_MAX_PROBES=2 } i:s:1 { exit(); }
                                     ~~~~~~~~~~~~~~~~~~~
 )");
@@ -2509,22 +2716,43 @@ config = { BPFTRACE_STACK_MODE=perf BPFTRACE_MAX_PROBES=2 } i:s:1 { exit(); }
   test_parse_failure("config = { BPFTRACE_STACK_MODE=perf } i:s:1 { "
                      "BPFTRACE_MAX_PROBES=2; exit(); }",
                      R"(
-stdin:1:66-67: ERROR: syntax error, unexpected =, expecting ++ or --
+stdin:1:66-67: ERROR: expected ';'
+config = { BPFTRACE_STACK_MODE=perf } i:s:1 { BPFTRACE_MAX_PROBES=2; exit(); }
+                                                                 ~
+stdin:1:66-67: ERROR: expected expression
+config = { BPFTRACE_STACK_MODE=perf } i:s:1 { BPFTRACE_MAX_PROBES=2; exit(); }
+                                                                 ~
+stdin:1:66-67: ERROR: expected ';'
+config = { BPFTRACE_STACK_MODE=perf } i:s:1 { BPFTRACE_MAX_PROBES=2; exit(); }
+                                                                 ~
+stdin:1:66-67: ERROR: unexpected input in block
 config = { BPFTRACE_STACK_MODE=perf } i:s:1 { BPFTRACE_MAX_PROBES=2; exit(); }
                                                                  ~
 )");
 
   test_parse_failure("config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }",
                      R"(
-stdin:1:8-9: ERROR: syntax error, unexpected {, expecting =
+stdin:1:8-9: ERROR: expected '='
 config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
        ~
+stdin:1:8-9: ERROR: expected attach point
+config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
+       ~
+stdin:1:8-9: ERROR: unexpected input
+config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
+       ~
+stdin:1:35-36: ERROR: expected '{'
+config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
+                                  ~
+stdin:1:37-38: ERROR: expected '{'
+config { BPFTRACE_STACK_MODE=perf } i:s:1 { exit(); }
+                                    ~
 )");
 
   test_parse_failure("BPFTRACE_STACK_MODE=perf; i:s:1 { exit(); }", R"(
-stdin:1:20-21: ERROR: syntax error, unexpected =, expecting {
+stdin:1:27-28: ERROR: expected '{'
 BPFTRACE_STACK_MODE=perf; i:s:1 { exit(); }
-                   ~
+                          ~
 )");
 }
 
@@ -2582,14 +2810,11 @@ TEST(Parser, subprog_void_no_args)
            Subprog("f", Typeof(SizedType(Type::voidtype)), {}, {})));
 }
 
-TEST(Parser, subprog_invalid_return_type)
+TEST(Parser, subprog_ident_return_type)
 {
-  // Error location is incorrect: #3063
-  test_parse_failure("fn f(): nonexistent {}", R"(
-stdin:1:9-20: ERROR: syntax error, unexpected identifier
-fn f(): nonexistent {}
-        ~~~~~~~~~~~
-)");
+  test("fn f(): nonexistent {}",
+       Program().WithFunction(
+           Subprog("f", Typeof(Identifier("nonexistent")), {}, {})));
 }
 
 TEST(Parser, subprog_one_arg)
@@ -2658,14 +2883,14 @@ TEST(Parser, subprog_enum_arg)
            {})));
 }
 
-TEST(Parser, subprog_invalid_arg)
+TEST(Parser, subprog_ident_arg_type)
 {
-  // Error location is incorrect: #3063
-  test_parse_failure("fn f($x : invalid): void {}", R"(
-stdin:1:11-18: ERROR: syntax error, unexpected identifier
-fn f($x : invalid): void {}
-          ~~~~~~~
-)");
+  test("fn f($x : nonexistent): void {}",
+       Program().WithFunction(Subprog(
+           "f",
+           Typeof(SizedType(Type::voidtype)),
+           { SubprogArg(Variable("$x"), Typeof(Identifier("nonexistent"))) },
+           {})));
 }
 
 TEST(Parser, subprog_return)
@@ -2676,6 +2901,36 @@ TEST(Parser, subprog_return)
                    Typeof(SizedType(Type::voidtype)),
                    {},
                    { Return(Binop(Operator::PLUS, Integer(1), Integer(1))) })));
+}
+
+TEST(Parser, jump_statements_require_separator)
+{
+  test_parse_failure("begin { break print(1); }", R"(
+stdin:1:15-20: ERROR: expected ';'
+begin { break print(1); }
+              ~~~~~
+)");
+
+  test_parse_failure("begin { continue print(1); }", R"(
+stdin:1:18-23: ERROR: expected ';'
+begin { continue print(1); }
+                 ~~~~~
+)");
+
+  test_parse_failure("begin { return 1 print(1); }", R"(
+stdin:1:18-23: ERROR: expected ';'
+begin { return 1 print(1); }
+                 ~~~~~
+)");
+}
+
+TEST(Parser, expression_statements_require_separator)
+{
+  test_parse_failure("begin { print(1) print(2); }", R"(
+stdin:1:18-23: ERROR: expected ';'
+begin { print(1) print(2); }
+                 ~~~~~
+)");
 }
 
 TEST(Parser, subprog_string)
@@ -2719,17 +2974,16 @@ TEST(Parser, for_loop)
                  Map("@map"),
                  { ExprStatement(Call("print", { Variable("$kv") })) }) })));
 
-  // Error location is incorrect: #3063
   // No body
   test_parse_failure("begin { for ($kv : @map) print($kv); }", R"(
-stdin:1:26-31: ERROR: syntax error, unexpected identifier, expecting {
+stdin:1:26-31: ERROR: expected '{'
 begin { for ($kv : @map) print($kv); }
                          ~~~~~
 )");
 
   // Map for decl
   test_parse_failure("begin { for (@kv : @map) { } }", R"(
-stdin:1:14-17: ERROR: syntax error, unexpected map, expecting variable
+stdin:1:14-17: ERROR: expected variable in for loop
 begin { for (@kv : @map) { } }
              ~~~
 )");
@@ -2746,33 +3000,108 @@ TEST(Parser, for_range)
 
   // Binary expressions must be wrapped.
   test_parse_failure("begin { for ($i : 1+1..10) { print($i) } }", R"(
-stdin:1:20-21: ERROR: syntax error, unexpected +, expecting [ or . or ->
+stdin:1:20-21: ERROR: expected ')'
 begin { for ($i : 1+1..10) { print($i) } }
                    ~
+stdin:1:20-21: ERROR: expected '{'
+begin { for ($i : 1+1..10) { print($i) } }
+                   ~
+stdin:1:20-21: ERROR: expected map or range in for loop
+begin { for ($i : 1+1..10) { print($i) } }
+                   ~
+stdin:1:20-21: ERROR: expected expression
+begin { for ($i : 1+1..10) { print($i) } }
+                   ~
+stdin:1:22-23: ERROR: expected ';'
+begin { for ($i : 1+1..10) { print($i) } }
+                     ~
+stdin:1:22-23: ERROR: expected expression
+begin { for ($i : 1+1..10) { print($i) } }
+                     ~
+stdin:1:22-23: ERROR: expected ';'
+begin { for ($i : 1+1..10) { print($i) } }
+                     ~
+stdin:1:22-23: ERROR: unexpected input in block
+begin { for ($i : 1+1..10) { print($i) } }
+                     ~
+stdin:1:23-24: ERROR: expected expression
+begin { for ($i : 1+1..10) { print($i) } }
+                      ~
+stdin:1:26-27: ERROR: expected ';'
+begin { for ($i : 1+1..10) { print($i) } }
+                         ~
+stdin:1:26-27: ERROR: expected expression
+begin { for ($i : 1+1..10) { print($i) } }
+                         ~
+stdin:1:26-27: ERROR: expected ';'
+begin { for ($i : 1+1..10) { print($i) } }
+                         ~
+stdin:1:26-27: ERROR: unexpected input in block
+begin { for ($i : 1+1..10) { print($i) } }
+                         ~
 )");
   test_parse_failure("begin { for ($i : 0..1+1) { print($i) } }", R"(
-stdin:1:23-24: ERROR: syntax error, unexpected +, expecting )
+stdin:1:23-24: ERROR: expected ')'
 begin { for ($i : 0..1+1) { print($i) } }
                       ~
+stdin:1:23-24: ERROR: expected '{'
+begin { for ($i : 0..1+1) { print($i) } }
+                      ~
+stdin:1:23-24: ERROR: expected expression
+begin { for ($i : 0..1+1) { print($i) } }
+                      ~
+stdin:1:25-26: ERROR: expected ';'
+begin { for ($i : 0..1+1) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: expected expression
+begin { for ($i : 0..1+1) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: expected ';'
+begin { for ($i : 0..1+1) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: unexpected input in block
+begin { for ($i : 0..1+1) { print($i) } }
+                        ~
 )");
 
   // Invalid range operator.
   test_parse_failure("begin { for ($i : 0...10) { print($i) } }", R"(
-stdin:1:22-23: ERROR: syntax error, unexpected .
+stdin:1:22-23: ERROR: expected expression
 begin { for ($i : 0...10) { print($i) } }
                      ~
+stdin:1:22-23: ERROR: expected ')'
+begin { for ($i : 0...10) { print($i) } }
+                     ~
+stdin:1:22-23: ERROR: expected '{'
+begin { for ($i : 0...10) { print($i) } }
+                     ~
+stdin:1:22-23: ERROR: expected expression
+begin { for ($i : 0...10) { print($i) } }
+                     ~
+stdin:1:25-26: ERROR: expected ';'
+begin { for ($i : 0...10) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: expected expression
+begin { for ($i : 0...10) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: expected ';'
+begin { for ($i : 0...10) { print($i) } }
+                        ~
+stdin:1:25-26: ERROR: unexpected input in block
+begin { for ($i : 0...10) { print($i) } }
+                        ~
 )");
 
   // Missing end range.
   test_parse_failure("begin { for ($i : 0..) { print($i) } }", R"(
-stdin:1:22-23: ERROR: syntax error, unexpected )
+stdin:1:22-23: ERROR: expected expression
 begin { for ($i : 0..) { print($i) } }
                      ~
 )");
 
   // Missing start range.
   test_parse_failure("begin { for ($i : ..10) { print($i) } }", R"(
-stdin:1:19-20: ERROR: syntax error, unexpected .
+stdin:1:19-20: ERROR: expected expression
 begin { for ($i : ..10) { print($i) } }
                   ~
 )");
@@ -2805,16 +3134,40 @@ TEST(Parser, variable_declarations)
 
   // Needs the let keyword
   test_parse_failure("begin { $x: int8; }", R"(
-stdin:1:11-12: ERROR: syntax error, unexpected :
+stdin:1:11-12: ERROR: expected expression
+begin { $x: int8; }
+          ~
+stdin:1:11-12: ERROR: expected ';'
+begin { $x: int8; }
+          ~
+stdin:1:11-12: ERROR: unexpected input in block
 begin { $x: int8; }
           ~
 )");
 
   // Needs the let keyword
   test_parse_failure("begin { $x: int8 = 1; }", R"(
-stdin:1:11-12: ERROR: syntax error, unexpected :
+stdin:1:11-12: ERROR: expected expression
 begin { $x: int8 = 1; }
           ~
+stdin:1:11-12: ERROR: expected ';'
+begin { $x: int8 = 1; }
+          ~
+stdin:1:11-12: ERROR: unexpected input in block
+begin { $x: int8 = 1; }
+          ~
+stdin:1:18-19: ERROR: expected ';'
+begin { $x: int8 = 1; }
+                 ~
+stdin:1:18-19: ERROR: expected expression
+begin { $x: int8 = 1; }
+                 ~
+stdin:1:18-19: ERROR: expected ';'
+begin { $x: int8 = 1; }
+                 ~
+stdin:1:18-19: ERROR: unexpected input in block
+begin { $x: int8 = 1; }
+                 ~
 )");
 }
 
@@ -2883,28 +3236,28 @@ TEST(Parser, block_expressions)
 {
   // Non-legal trailing statement
   test_parse_failure("begin { $x = { $a = 1; $b = 2 } exit(); }", R"(
-stdin:1:31-32: ERROR: syntax error, unexpected }, expecting ;
+stdin:1:33-37: ERROR: expected ';'
 begin { $x = { $a = 1; $b = 2 } exit(); }
-                              ~
+                                ~~~~
 )");
 
   // No expression, statement with trailing ;
   test_parse_failure("begin { $x = { $a = 1; $b = 2; } exit(); }", R"(
-stdin:1:32-33: ERROR: syntax error, unexpected }
+stdin:1:34-38: ERROR: expected ';'
 begin { $x = { $a = 1; $b = 2; } exit(); }
-                               ~
+                                 ~~~~
 )");
 
   // Missing ; after block expression
   test_parse_failure("begin { $x = { $a = 1; $a } exit(); }", R"(
-stdin:1:29-33: ERROR: syntax error, unexpected identifier, expecting ; or }
+stdin:1:29-33: ERROR: expected ';'
 begin { $x = { $a = 1; $a } exit(); }
                             ~~~~
 )");
 
   // Illegal; no map assignment
   test_parse_failure("begin { $x = { $a = 1; count() } exit(); }", R"(
-stdin:1:34-38: ERROR: syntax error, unexpected identifier, expecting ; or }
+stdin:1:34-38: ERROR: expected ';'
 begin { $x = { $a = 1; count() } exit(); }
                                  ~~~~
 )");
@@ -2944,15 +3297,24 @@ TEST(Parser, map_declarations)
            .WithProbe(Probe({ "begin" }, { ExprStatement(Variable("$x")) })));
 
   test_parse_failure("@a = hash(); begin { $x; }", R"(
-stdin:1:4-5: ERROR: syntax error, unexpected =
+stdin:1:4-5: ERROR: expected '{'
 @a = hash(); begin { $x; }
    ~
+stdin:1:6-10: ERROR: expected '{'
+@a = hash(); begin { $x; }
+     ~~~~
+stdin:1:14-19: ERROR: expected '{'
+@a = hash(); begin { $x; }
+             ~~~~~
 )");
 
   test_parse_failure("let @a = hash(); begin { $x; }", R"(
-stdin:1:15-16: ERROR: syntax error, unexpected ), expecting integer
+stdin:1:15-16: ERROR: expected positive integer for map declaration max entries
 let @a = hash(); begin { $x; }
               ~
+stdin:1:18-23: ERROR: expected '{'
+let @a = hash(); begin { $x; }
+                 ~~~~~
 )");
 }
 
@@ -2975,6 +3337,14 @@ begin { M; }
                            "begin { M; }",
                            R"(
 stdin:2:9-10: ERROR: unable to expand macro as an expression: {
+begin { M; }
+        ~
+)");
+
+  test_macro_parse_failure("#define M \"a\" \"b\"\n"
+                           "begin { M; }",
+                           R"(
+stdin:2:9-10: ERROR: unable to expand macro as an expression: "a""b"
 begin { M; }
         ~
 )");
@@ -3008,21 +3378,36 @@ TEST(Parser, imports)
            .WithProbe(Probe({ "begin" }, {})));
 
   test_parse_failure(R"(begin { }; import "foo";)", R"(
-stdin:1:10-11: ERROR: syntax error, unexpected ;
+stdin:1:12-18: ERROR: expected '{'
 begin { }; import "foo";
-         ~
+           ~~~~~~
+stdin:1:12-18: ERROR: imports must appear before probes and functions
+begin { }; import "foo";
+           ~~~~~~
 )");
 
   test_parse_failure("import 0; begin { }", R"(
-stdin:1:8-9: ERROR: syntax error, unexpected integer, expecting string
+stdin:1:8-9: ERROR: expected string after 'import'
 import 0; begin { }
        ~
+stdin:1:11-16: ERROR: expected '{'
+import 0; begin { }
+          ~~~~~
 )");
 
   test_parse_failure("import foo; begin { }", R"(
-stdin:1:8-11: ERROR: syntax error, unexpected identifier, expecting string
+stdin:1:8-11: ERROR: expected string after 'import'
 import foo; begin { }
        ~~~
+stdin:1:13-18: ERROR: expected '{'
+import foo; begin { }
+            ~~~~~
+)");
+
+  test_parse_failure(R"(begin { import "foo" print(1); })", R"(
+stdin:1:22-27: ERROR: expected ';' after import
+begin { import "foo" print(1); }
+                     ~~~~~
 )");
 }
 
@@ -3243,10 +3628,10 @@ TEST(Parser, naked_expression)
 {
   std::stringstream out;
   ast::ASTContext ast("stdin", "1 + 2 + 3");
-  Driver driver(ast);
-  driver.parse_expr();
+  RDParser parser(ast);
+  auto result = parser.parse_expr();
   ASSERT_TRUE(ast.diagnostics().ok());
-  ASSERT_TRUE(std::holds_alternative<ast::Expression>(driver.result));
+  ASSERT_TRUE(result.has_value());
 }
 
 TEST(Parser, while_loop_unary_condition)

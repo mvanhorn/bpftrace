@@ -1133,4 +1133,30 @@ TEST_F(TypeResolverTest, cast)
   }
 }
 
+TEST_F(TypeResolverTest, macro_not_expanded_in_type_context)
+{
+  // Bare identifiers in type contexts (sizeof, casts) should not be
+  // macro-expanded. The identifier is treated as a type name instead.
+  {
+    // sizeof: bare identifier not expanded, treated as unknown type.
+    test(R"(macro mytype() { 1 } begin { $x = sizeof(mytype); })", Error{});
+  }
+  {
+    // cast: bare identifier not expanded, treated as unknown type.
+    test(R"(macro mytype() { 1 } begin { $x = (mytype)1; })", Error{});
+  }
+  {
+    // sizeof: call syntax forces macro expansion.
+    auto result = test(
+        R"(macro mytype() { 1 } begin { $x = sizeof(mytype()); })");
+    EXPECT_EQ(var_type(result, "$x"), CreateUInt8());
+  }
+  {
+    // cast: typeof wrapper with call syntax forces macro expansion.
+    auto result = test(
+        R"(macro mytype() { 1 } begin { $x = (typeof(mytype()))1; })");
+    EXPECT_EQ(var_type(result, "$x"), CreateUInt8());
+  }
+}
+
 } // namespace bpftrace::test::type_resolver

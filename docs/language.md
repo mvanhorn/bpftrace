@@ -1729,6 +1729,28 @@ When casting to an array, it is possible to omit the size which will be determin
 
 Integers are internally represented as 64 bit signed. If you need another representation, you may cast to the supported [Data Types](#data-types).
 
+### Cast Parsing
+
+Most C-style casting is supported, however due to bpftrace's builtins, which are raw identifiers (e.g. `pid`), and macros which can be called without parenthesis if the macro doesn't have any arguments, a raw identifier wrapped in parenthesis is considered a type when followed by something that looks like an expression start.
+
+```
+$w = (myident); // parsed as an expression and not a type
+$x = (myident)*$a; // parsed as a cast to myident type with a dereference of $a
+$y = (pid)*tid; // parsed a multiplication of the pid builtin and the tid builtin
+$z = (myident)*arg0; // parsed as a cast to myident with a dereference of builtin arg0
+```
+
+Bare identifiers in type contexts (casts, `sizeof`, etc.) are always treated
+as type names and are never expanded as macros. To force macro expansion in a
+type context, use the call syntax or wrap with `typeof`:
+
+```
+macro uint64_t() { 1 }
+$x = sizeof(uint64_t);           // uint64_t is treated as a type name and $x evaluates to 8
+$x = sizeof(uint64_t());         // call syntax forces macro expansion and $x evaluates to 1
+$y = (typeof(uint64_t()))$z;     // typeof wrapper for casts and this becomes $y = (typeof({ 1 }))$z;
+```
+
 ### Array casts
 
 It is possible to cast between integer arrays and integers.
